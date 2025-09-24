@@ -1,12 +1,23 @@
-use std::ptr;
+use std::num::NonZeroUsize;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
-use typst::eval::AutoValue;
+use typst_utils::{NonZeroExt, Scalar, singleton};
 
-use super::{AlignElem, ColumnsElem};
-use crate::meta::{Counter, CounterKey, ManualPageCounter, Numbering};
-use crate::prelude::*;
-use crate::text::TextElem;
+use crate::diag::{SourceResult, bail};
+use crate::engine::Engine;
+use crate::foundations::{
+    Args, AutoValue, Cast, Construct, Content, Dict, Fold, NativeElement, Set, Smart,
+    Value, cast, elem,
+};
+use crate::introspection::Introspector;
+use crate::layout::{
+    Abs, Alignment, FlushElem, Frame, HAlignment, Length, OuterVAlignment, Ratio, Rel,
+    Sides, SpecificAlignment,
+};
+use crate::model::{DocumentInfo, Numbering};
+use crate::text::LocalName;
+use crate::visualize::{Color, Paint};
 
 /// Layouts its child onto one or multiple pages.
 ///
@@ -27,9 +38,12 @@ use crate::text::TextElem;
 ///
 /// There you go, US friends!
 /// ```
-#[elem]
+#[elem(Construct)]
 pub struct PageElem {
     /// A standard paper size to set width and height.
+    ///
+    /// This is just a shorthand for setting `width` and `height` and, as such,
+    /// cannot be retrieved in a context expression.
     #[external]
     #[default(Paper::A4)]
     pub paper: Paper,
@@ -46,27 +60,28 @@ pub struct PageElem {
     ///   box(square(width: 1cm))
     /// }
     /// ```
-    #[resolve]
     #[parse(
         let paper = args.named_or_find::<Paper>("paper")?;
         args.named("width")?
             .or_else(|| paper.map(|paper| Smart::Custom(paper.width().into())))
     )]
     #[default(Smart::Custom(Paper::A4.width().into()))]
+    #[ghost]
     pub width: Smart<Length>,
 
     /// The height of the page.
     ///
     /// If this is set to `{auto}`, page breaks can only be triggered manually
-    /// by inserting a [page break]($pagebreak). Most examples throughout this
-    /// documentation use `{auto}` for the height of the page to dynamically
-    /// grow and shrink to fit their content.
-    #[resolve]
+    /// by inserting a [page break]($pagebreak) or by adding another non-empty
+    /// page set rule. Most examples throughout this documentation use `{auto}`
+    /// for the height of the page to dynamically grow and shrink to fit their
+    /// content.
     #[parse(
         args.named("height")?
             .or_else(|| paper.map(|paper| Smart::Custom(paper.height().into())))
     )]
     #[default(Smart::Custom(Paper::A4.height().into()))]
+    #[ghost]
     pub height: Smart<Length>,
 
     /// Whether the page is flipped into landscape orientation.
@@ -88,12 +103,13 @@ pub struct PageElem {
     /// +1 555 555 5555
     /// ```
     #[default(false)]
+    #[ghost]
     pub flipped: bool,
 
     /// The page's margins.
     ///
     /// - `{auto}`: The margins are set automatically to 2.5/21 times the smaller
-    ///   dimension of the page. This results in 2.5cm margins for an A4 page.
+    ///   dimension of the page. This results in 2.5 cm margins for an A4 page.
     /// - A single length: The same margin on all sides.
     /// - A dictionary: With a dictionary, the margins can be set individually.
     ///   The dictionary can contain the following keys in order of precedence:
@@ -110,8 +126,10 @@ pub struct PageElem {
     ///   - `rest`: The margins on all sides except those for which the
     ///     dictionary explicitly sets a size.
     ///
-    /// The values for `left` and `right` are mutually exclusive with
-    /// the values for `inside` and `outside`.
+    /// All keys are optional; omitted keys will use their previously set value,
+    /// or the default margin if never set. In addition, the values for `left`
+    /// and `right` are mutually exclusive with the values for `inside` and
+    /// `outside`.
     ///
     /// ```example
     /// #set page(
@@ -127,6 +145,7 @@ pub struct PageElem {
     /// )
     /// ```
     #[fold]
+    #[ghost]
     pub margin: Margin,
 
     /// On which side the pages will be bound.
@@ -138,6 +157,7 @@ pub struct PageElem {
     ///
     /// This affects the meaning of the `inside` and `outside` options for
     /// margins.
+    #[ghost]
     pub binding: Smart<Binding>,
 
     /// How many columns the page has.
@@ -158,26 +178,51 @@ pub struct PageElem {
     /// of a rapidly changing climate.
     /// ```
     #[default(NonZeroUsize::ONE)]
+    #[ghost]
     pub columns: NonZeroUsize,
 
-    /// The page's background color.
+    /// The page's background fill.
     ///
-    /// This instructs the printer to color the complete page with the given
-    /// color. If you are considering larger production runs, it may be more
-    /// environmentally friendly and cost-effective to source pre-dyed pages and
-    /// not set this property.
+    /// Setting this to something non-transparent instructs the printer to color
+    /// the complete page. If you are considering larger production runs, it may
+    /// be more environmentally friendly and cost-effective to source pre-dyed
+    /// pages and not set this property.
+    ///
+    /// When set to `{none}`, the background becomes transparent. Note that PDF
+    /// pages will still appear with a (usually white) background in viewers,
+    /// but they are actually transparent. (If you print them, no color is used
+    /// for the background.)
+    ///
+    /// The default of `{auto}` results in `{none}` for PDF output, and
+    /// `{white}` for PNG and SVG.
     ///
     /// ```example
     /// #set page(fill: rgb("444352"))
     /// #set text(fill: rgb("fdfdfd"))
     /// *Dark mode enabled.*
     /// ```
-    pub fill: Option<Paint>,
+    #[ghost]
+    pub fill: Smart<Option<Paint>>,
 
-    /// How to [number]($numbering) the pages.
+    /// How to number the pages. You can refer to the Page Setup Guide for
+    /// [customizing page numbers]($guides/page-setup-guide/#page-numbers).
     ///
-    /// If an explicit `footer` (or `header` for top-aligned numbering) is
-    /// given, the numbering is ignored.
+    /// Accepts a [numbering pattern or function]($numbering) taking one or two
+    /// numbers:
+    /// 1. The first number is the current page number.
+    /// 2. The second number is the total number of pages. In a numbering
+    ///    pattern, the second number can be omitted. If a function is passed,
+    ///    it will always receive both numbers.
+    ///
+    /// These are logical numbers controlled by the page counter, and may thus
+    /// not match the physical numbers. Specifically, they are the
+    /// [current]($counter.get) and the [final]($counter.final) value of
+    /// `{counter(page)}`. See the [`counter`]($counter/#page-counter)
+    /// documentation for more details.
+    ///
+    /// If an explicit [`footer`]($page.footer) (or [`header`]($page.header) for
+    /// [top-aligned]($page.number-align) numbering) is given, the numbering is
+    /// ignored.
     ///
     /// ```example
     /// #set page(
@@ -188,7 +233,21 @@ pub struct PageElem {
     ///
     /// #lorem(48)
     /// ```
+    #[ghost]
     pub numbering: Option<Numbering>,
+
+    /// A supplement for the pages.
+    ///
+    /// For page references, this is added before the page number.
+    ///
+    /// ```example
+    /// #set page(numbering: "1.", supplement: [p.])
+    ///
+    /// = Introduction <intro>
+    /// We are on #ref(<intro>, form: "page")!
+    /// ```
+    #[ghost]
+    pub supplement: Smart<Option<Content>>,
 
     /// The alignment of the page numbering.
     ///
@@ -206,19 +265,16 @@ pub struct PageElem {
     ///
     /// #lorem(30)
     /// ```
-    #[default(HAlign::Center + VAlign::Bottom)]
-    #[parse({
-        let option: Option<Spanned<Align>> = args.named("number-align")?;
-        if let Some(Spanned { v: align, span }) = option {
-            if align.y() == Some(VAlign::Horizon) {
-                bail!(span, "page number cannot be `horizon`-aligned");
-            }
-        }
-        option.map(|spanned| spanned.v)
-    })]
-    pub number_align: Align,
+    #[default(SpecificAlignment::Both(HAlignment::Center, OuterVAlignment::Bottom))]
+    #[ghost]
+    pub number_align: SpecificAlignment<HAlignment, OuterVAlignment>,
 
     /// The page's header. Fills the top margin of each page.
+    ///
+    /// - Content: Shows the content as the header.
+    /// - `{auto}`: Shows the page number if a [`numbering`]($page.numbering) is
+    ///   set and [`number-align`]($page.number-align) is `top`.
+    /// - `{none}`: Suppresses the header.
     ///
     /// ```example
     /// #set par(justify: true)
@@ -226,24 +282,30 @@ pub struct PageElem {
     ///   margin: (top: 32pt, bottom: 20pt),
     ///   header: [
     ///     #set text(8pt)
-    ///     #smallcaps[Typst Academcy]
+    ///     #smallcaps[Typst Academy]
     ///     #h(1fr) _Exercise Sheet 3_
     ///   ],
     /// )
     ///
     /// #lorem(19)
     /// ```
-    pub header: Option<Content>,
+    #[ghost]
+    pub header: Smart<Option<Content>>,
 
     /// The amount the header is raised into the top margin.
-    #[resolve]
     #[default(Ratio::new(0.3).into())]
+    #[ghost]
     pub header_ascent: Rel<Length>,
 
     /// The page's footer. Fills the bottom margin of each page.
     ///
-    /// For just a page number, the `numbering` property, typically suffices. If
-    /// you want to create a custom footer, but still display the page number,
+    /// - Content: Shows the content as the footer.
+    /// - `{auto}`: Shows the page number if a [`numbering`]($page.numbering) is
+    ///   set and [`number-align`]($page.number-align) is `bottom`.
+    /// - `{none}`: Suppresses the footer.
+    ///
+    /// For just a page number, the `numbering` property typically suffices. If
+    /// you want to create a custom footer but still display the page number,
     /// you can directly access the [page counter]($counter).
     ///
     /// ```example
@@ -251,7 +313,7 @@ pub struct PageElem {
     /// #set page(
     ///   height: 100pt,
     ///   margin: 20pt,
-    ///   footer: [
+    ///   footer: context [
     ///     #set align(right)
     ///     #set text(8pt)
     ///     #counter(page).display(
@@ -263,11 +325,12 @@ pub struct PageElem {
     ///
     /// #lorem(48)
     /// ```
-    pub footer: Option<Content>,
+    #[ghost]
+    pub footer: Smart<Option<Content>>,
 
     /// The amount the footer is lowered into the bottom margin.
-    #[resolve]
     #[default(Ratio::new(0.3).into())]
+    #[ghost]
     pub footer_descent: Rel<Length>,
 
     /// Content in the page's background.
@@ -286,6 +349,7 @@ pub struct PageElem {
     /// In the year 2023, we plan to take
     /// over the world (of typesetting).
     /// ```
+    #[ghost]
     pub background: Option<Content>,
 
     /// Content in the page's foreground.
@@ -293,12 +357,13 @@ pub struct PageElem {
     /// This content will overlay the page's body.
     ///
     /// ```example
-    /// #set page(foreground: text(24pt)[🥸])
+    /// #set page(foreground: text(24pt)[🤓])
     ///
     /// Reviewer 2 has marked our paper
     /// "Weak Reject" because they did
     /// not understand our approach...
     /// ```
+    #[ghost]
     pub foreground: Option<Content>,
 
     /// The contents of the page(s).
@@ -306,210 +371,154 @@ pub struct PageElem {
     /// Multiple pages will be created if the content does not fit on a single
     /// page. A new page with the page properties prior to the function invocation
     /// will be created after the body has been typeset.
+    #[external]
     #[required]
     pub body: Content,
-
-    /// Whether the page should be aligned to an even or odd page.
-    #[internal]
-    pub clear_to: Option<Parity>,
 }
 
-impl PageElem {
-    /// A document can consist of multiple `PageElem`s, one per run of pages
-    /// with equal properties (not one per actual output page!). The `number` is
-    /// the physical page number of the first page of this run. It is mutated
-    /// while we post-process the pages in this function. This function returns
-    /// a fragment consisting of multiple frames, one per output page of this
-    /// page run.
-    #[tracing::instrument(skip_all)]
-    pub fn layout(
-        &self,
-        vt: &mut Vt,
-        styles: StyleChain,
-        page_counter: &mut ManualPageCounter,
-        extend_to: Option<Parity>,
-    ) -> SourceResult<Fragment> {
-        tracing::info!("Page layout");
+impl Construct for PageElem {
+    fn construct(engine: &mut Engine, args: &mut Args) -> SourceResult<Content> {
+        // The page constructor is special: It doesn't create a page element.
+        // Instead, it just ensures that the passed content lives in a separate
+        // page and styles it.
+        let styles = Self::set(engine, args)?;
+        let body = args.expect::<Content>("body")?;
+        Ok(Content::sequence([
+            PagebreakElem::shared_weak().clone(),
+            // We put an effectless, invisible non-tag element on the page.
+            // This has two desirable consequences:
+            // - The page is kept even if the body is empty
+            // - The page doesn't inherit shared styles from the body
+            FlushElem::new().pack(),
+            body,
+            PagebreakElem::shared_boundary().clone(),
+        ])
+        .styled_with_map(styles))
+    }
+}
 
-        // When one of the lengths is infinite the page fits its content along
-        // that axis.
-        let width = self.width(styles).unwrap_or(Abs::inf());
-        let height = self.height(styles).unwrap_or(Abs::inf());
-        let mut size = Size::new(width, height);
-        if self.flipped(styles) {
-            std::mem::swap(&mut size.x, &mut size.y);
-        }
+impl LocalName for PageElem {
+    const KEY: &'static str = "page";
+}
 
-        let mut min = width.min(height);
-        if !min.is_finite() {
-            min = Paper::A4.width();
-        }
+/// A manual page break.
+///
+/// Must not be used inside any containers.
+///
+/// # Example
+/// ```example
+/// The next page contains
+/// more details on compound theory.
+/// #pagebreak()
+///
+/// == Compound Theory
+/// In 1984, the first ...
+/// ```
+///
+/// Even without manual page breaks, content will be automatically paginated
+/// based on the configured page size. You can set [the page height]($page.height)
+/// to `{auto}` to let the page grow dynamically until a manual page break
+/// occurs.
+///
+/// Pagination tries to avoid single lines of text at the top or bottom of a
+/// page (these are called _widows_ and _orphans_). You can adjust the
+/// [`text.costs`] parameter to disable this behavior.
+#[elem(title = "Page Break")]
+pub struct PagebreakElem {
+    /// If `{true}`, the page break is skipped if the current page is already
+    /// empty.
+    #[default(false)]
+    pub weak: bool,
 
-        // Determine the margins.
-        let default = Rel::<Length>::from((2.5 / 21.0) * min);
-        let margin = self.margin(styles);
-        let two_sided = margin.two_sided.unwrap_or(false);
-        let margin = margin
-            .sides
-            .map(|side| side.and_then(Smart::as_custom).unwrap_or(default))
-            .resolve(styles)
-            .relative_to(size);
+    /// If given, ensures that the next page will be an even/odd page, with an
+    /// empty page in between if necessary.
+    ///
+    /// ```example
+    /// #set page(height: 30pt)
+    ///
+    /// First.
+    /// #pagebreak(to: "odd")
+    /// Third.
+    /// ```
+    pub to: Option<Parity>,
 
-        // Determine the binding.
-        let binding =
-            self.binding(styles)
-                .unwrap_or_else(|| match TextElem::dir_in(styles) {
-                    Dir::LTR => Binding::Left,
-                    _ => Binding::Right,
-                });
+    /// Whether this pagebreak designates an end boundary of a page run. This is
+    /// an even weaker version of pagebreak `weak` because it not only doesn't
+    /// force an empty page, but also doesn't force its initial styles onto a
+    /// staged empty page.
+    #[internal]
+    #[parse(None)]
+    #[default(false)]
+    pub boundary: bool,
+}
 
-        // Realize columns.
-        let mut child = self.body();
-        let columns = self.columns(styles);
-        if columns.get() > 1 {
-            child = ColumnsElem::new(child).with_count(columns).pack();
-        }
+impl PagebreakElem {
+    /// Get the globally shared weak pagebreak element.
+    pub fn shared_weak() -> &'static Content {
+        singleton!(Content, PagebreakElem::new().with_weak(true).pack())
+    }
 
-        let area = size - margin.sum_by_axis();
-        let mut regions = Regions::repeat(area, area.map(Abs::is_finite));
-        regions.root = true;
+    /// Get the globally shared boundary pagebreak element.
+    pub fn shared_boundary() -> &'static Content {
+        singleton!(
+            Content,
+            PagebreakElem::new().with_weak(true).with_boundary(true).pack()
+        )
+    }
+}
 
-        // Layout the child.
-        let mut frames = child.layout(vt, styles, regions)?.into_frames();
+/// A finished document with metadata and page frames.
+#[derive(Debug, Default, Clone)]
+pub struct PagedDocument {
+    /// The document's finished pages.
+    pub pages: Vec<Page>,
+    /// Details about the document.
+    pub info: DocumentInfo,
+    /// Provides the ability to execute queries on the document.
+    pub introspector: Introspector,
+}
 
-        // Align the child to the pagebreak's parity.
-        // Check for page count after adding the pending frames
-        if extend_to
-            .is_some_and(|p| !p.matches(page_counter.physical().get() + frames.len()))
-        {
-            // Insert empty page after the current pages.
-            let size = area.map(Abs::is_finite).select(area, Size::zero());
-            frames.push(Frame::hard(size));
-        }
+/// A finished page.
+#[derive(Debug, Clone, Hash)]
+pub struct Page {
+    /// The frame that defines the page.
+    pub frame: Frame,
+    /// How the page is filled.
+    ///
+    /// - When `None`, the background is transparent.
+    /// - When `Auto`, the background is transparent for PDF and white
+    ///   for raster and SVG targets.
+    ///
+    /// Exporters should access the resolved value of this property through
+    /// `fill_or_transparent()` or `fill_or_white()`.
+    pub fill: Smart<Option<Paint>>,
+    /// The page's numbering.
+    pub numbering: Option<Numbering>,
+    /// The page's supplement.
+    pub supplement: Content,
+    /// The logical page number (controlled by `counter(page)` and may thus not
+    /// match the physical number).
+    pub number: u64,
+}
 
-        let fill = self.fill(styles);
-        let foreground = self.foreground(styles);
-        let background = self.background(styles);
-        let header_ascent = self.header_ascent(styles);
-        let footer_descent = self.footer_descent(styles);
-        let numbering = self.numbering(styles);
-        let numbering_meta = Meta::PageNumbering(numbering.clone().into_value());
-        let number_align = self.number_align(styles);
-        let mut header = self.header(styles);
-        let mut footer = self.footer(styles);
+impl Page {
+    /// Get the configured background or `None` if it is `Auto`.
+    ///
+    /// This is used in PDF export.
+    pub fn fill_or_transparent(&self) -> Option<Paint> {
+        self.fill.clone().unwrap_or(None)
+    }
 
-        // Construct the numbering (for header or footer).
-        let numbering_marginal = numbering.clone().map(|numbering| {
-            let both = match &numbering {
-                Numbering::Pattern(pattern) => pattern.pieces() >= 2,
-                Numbering::Func(_) => true,
-            };
-
-            let mut counter =
-                Counter::new(CounterKey::Page).display(Some(numbering), both);
-
-            // We interpret the Y alignment as selecting header or footer
-            // and then ignore it for aligning the actual number.
-            if let Some(x) = number_align.x() {
-                counter = counter.aligned(x.into());
-            }
-
-            counter
-        });
-
-        if matches!(number_align.y(), Some(VAlign::Top)) {
-            header = header.or(numbering_marginal);
-        } else {
-            footer = footer.or(numbering_marginal);
-        }
-
-        // Post-process pages.
-        for frame in frames.iter_mut() {
-            tracing::info!("Layouting page #{}", page_counter.physical());
-
-            // The padded width of the page's content without margins.
-            let pw = frame.width();
-
-            // If two sided, left becomes inside and right becomes outside.
-            // Thus, for left-bound pages, we want to swap on even pages and
-            // for right-bound pages, we want to swap on odd pages.
-            let mut margin = margin;
-            if two_sided && binding.swap(page_counter.physical()) {
-                std::mem::swap(&mut margin.left, &mut margin.right);
-            }
-
-            // Realize margins.
-            frame.set_size(frame.size() + margin.sum_by_axis());
-            frame.translate(Point::new(margin.left, margin.top));
-            frame.push_positionless_meta(numbering_meta.clone());
-
-            // The page size with margins.
-            let size = frame.size();
-
-            // Realize overlays.
-            for (name, marginal) in [
-                ("header", &header),
-                ("footer", &footer),
-                ("background", &background),
-                ("foreground", &foreground),
-            ] {
-                tracing::info!("Layouting {name}");
-
-                let Some(content) = marginal else { continue };
-
-                let (pos, area, align);
-                if ptr::eq(marginal, &header) {
-                    let ascent = header_ascent.relative_to(margin.top);
-                    pos = Point::with_x(margin.left);
-                    area = Size::new(pw, margin.top - ascent);
-                    align = Align::BOTTOM;
-                } else if ptr::eq(marginal, &footer) {
-                    let descent = footer_descent.relative_to(margin.bottom);
-                    pos = Point::new(margin.left, size.y - margin.bottom + descent);
-                    area = Size::new(pw, margin.bottom - descent);
-                    align = Align::TOP;
-                } else {
-                    pos = Point::zero();
-                    area = size;
-                    align = HAlign::Center + VAlign::Horizon;
-                };
-
-                let pod = Regions::one(area, Axes::splat(true));
-                let sub = content
-                    .clone()
-                    .styled(AlignElem::set_alignment(align))
-                    .layout(vt, styles, pod)?
-                    .into_frame();
-
-                if ptr::eq(marginal, &header) || ptr::eq(marginal, &background) {
-                    frame.prepend_frame(pos, sub);
-                } else {
-                    frame.push_frame(pos, sub);
-                }
-            }
-
-            if let Some(fill) = &fill {
-                frame.fill(fill.clone());
-            }
-
-            page_counter.visit(vt, frame)?;
-
-            // Add a PDF page label if there is a numbering.
-            if let Some(num) = &numbering {
-                if let Some(page_label) = num.apply_pdf(page_counter.logical()) {
-                    frame.push_positionless_meta(Meta::PdfPageLabel(page_label));
-                }
-            }
-
-            page_counter.step();
-        }
-
-        Ok(Fragment::frames(frames))
+    /// Get the configured background or white if it is `Auto`.
+    ///
+    /// This is used in raster and SVG export.
+    pub fn fill_or_white(&self) -> Option<Paint> {
+        self.fill.clone().unwrap_or_else(|| Some(Color::WHITE.into()))
     }
 }
 
 /// Specification of the page's margins.
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Margin {
     /// The margins for each side.
     pub sides: Sides<Option<Smart<Rel<Length>>>>,
@@ -525,41 +534,48 @@ impl Margin {
     }
 }
 
-impl Fold for Margin {
-    type Output = Margin;
+impl Default for Margin {
+    fn default() -> Self {
+        Self {
+            sides: Sides::splat(Some(Smart::Auto)),
+            two_sided: None,
+        }
+    }
+}
 
-    fn fold(self, outer: Self::Output) -> Self::Output {
-        let sides =
-            self.sides
-                .zip(outer.sides)
-                .map(|(inner, outer)| match (inner, outer) {
-                    (Some(value), Some(outer)) => Some(value.fold(outer)),
-                    _ => inner.or(outer),
-                });
-        let two_sided = self.two_sided.or(outer.two_sided);
-        Margin { sides, two_sided }
+impl Fold for Margin {
+    fn fold(self, outer: Self) -> Self {
+        Margin {
+            sides: self.sides.fold(outer.sides),
+            two_sided: self.two_sided.fold(outer.two_sided),
+        }
     }
 }
 
 cast! {
     Margin,
     self => {
+        let two_sided = self.two_sided.unwrap_or(false);
+        if !two_sided && self.sides.is_uniform()
+            && let Some(left) = self.sides.left {
+                return left.into_value();
+            }
+
         let mut dict = Dict::new();
-        let mut handle = |key: &str, component: Value| {
-            let value = component.into_value();
-            if value != Value::None {
-                dict.insert(key.into(), value);
+        let mut handle = |key: &str, component: Option<Smart<Rel<Length>>>| {
+            if let Some(c) = component {
+                dict.insert(key.into(), c.into_value());
             }
         };
 
-        handle("top", self.sides.top.into_value());
-        handle("bottom", self.sides.bottom.into_value());
-        if self.two_sided.unwrap_or(false) {
-            handle("inside", self.sides.left.into_value());
-            handle("outside", self.sides.right.into_value());
+        handle("top", self.sides.top);
+        handle("bottom", self.sides.bottom);
+        if two_sided {
+            handle("inside", self.sides.left);
+            handle("outside", self.sides.right);
         } else {
-            handle("left", self.sides.left.into_value());
-            handle("right", self.sides.right.into_value());
+            handle("left", self.sides.left);
+            handle("right", self.sides.right);
         }
 
         Value::Dict(dict)
@@ -621,7 +637,7 @@ pub enum Binding {
 
 impl Binding {
     /// Whether to swap left and right margin for the page with this number.
-    fn swap(self, number: NonZeroUsize) -> bool {
+    pub fn swap(self, number: NonZeroUsize) -> bool {
         match self {
             // Left-bound must swap on even pages
             // (because it is correct on the first page).
@@ -636,76 +652,51 @@ impl Binding {
 cast! {
     Binding,
     self => match self {
-        Self::Left => Align::LEFT.into_value(),
-        Self::Right => Align::RIGHT.into_value(),
+        Self::Left => Alignment::LEFT.into_value(),
+        Self::Right => Alignment::RIGHT.into_value(),
     },
-    v: Align => match v {
-        Align::LEFT => Self::Left,
-        Align::RIGHT => Self::Right,
+    v: Alignment => match v {
+        Alignment::LEFT => Self::Left,
+        Alignment::RIGHT => Self::Right,
         _ => bail!("must be `left` or `right`"),
     },
 }
 
-/// A header, footer, foreground or background definition.
-#[derive(Debug, Clone, Hash)]
-pub enum Marginal {
-    /// Bare content.
-    Content(Content),
-    /// A closure mapping from a page number to content.
-    Func(Func),
-}
+/// A list of page ranges to be exported.
+#[derive(Debug, Clone)]
+pub struct PageRanges(Vec<PageRange>);
 
-impl Marginal {
-    /// Resolve the marginal based on the page number.
-    pub fn resolve(&self, vt: &mut Vt, page: usize) -> SourceResult<Content> {
-        Ok(match self {
-            Self::Content(content) => content.clone(),
-            Self::Func(func) => func.call_vt(vt, [page])?.display(),
+/// A range of pages to export.
+///
+/// The range is one-indexed. For example, `1..=3` indicates the first, second
+/// and third pages should be exported.
+pub type PageRange = RangeInclusive<Option<NonZeroUsize>>;
+
+impl PageRanges {
+    /// Create new page ranges.
+    pub fn new(ranges: Vec<PageRange>) -> Self {
+        Self(ranges)
+    }
+
+    /// Check if a page, given its number, should be included when exporting the
+    /// document while restricting the exported pages to these page ranges.
+    /// This is the one-indexed version of 'includes_page_index'.
+    pub fn includes_page(&self, page: NonZeroUsize) -> bool {
+        self.includes_page_index(page.get() - 1)
+    }
+
+    /// Check if a page, given its index, should be included when exporting the
+    /// document while restricting the exported pages to these page ranges.
+    /// This is the zero-indexed version of 'includes_page'.
+    pub fn includes_page_index(&self, page: usize) -> bool {
+        let page = NonZeroUsize::try_from(page + 1).unwrap();
+        self.0.iter().any(|range| match (range.start(), range.end()) {
+            (Some(start), Some(end)) => (start..=end).contains(&&page),
+            (Some(start), None) => (start..).contains(&&page),
+            (None, Some(end)) => (..=end).contains(&&page),
+            (None, None) => true,
         })
     }
-}
-
-cast! {
-    Marginal,
-    self => match self {
-        Self::Content(v) => v.into_value(),
-        Self::Func(v) => v.into_value(),
-    },
-    v: Content => Self::Content(v),
-    v: Func => Self::Func(v),
-}
-
-/// A manual page break.
-///
-/// Must not be used inside any containers.
-///
-/// # Example
-/// ```example
-/// The next page contains
-/// more details on compound theory.
-/// #pagebreak()
-///
-/// == Compound Theory
-/// In 1984, the first ...
-/// ```
-#[elem(title = "Page Break")]
-pub struct PagebreakElem {
-    /// If `{true}`, the page break is skipped if the current page is already
-    /// empty.
-    #[default(false)]
-    pub weak: bool,
-
-    /// If given, ensures that the next page will be an even/odd page, with an
-    /// empty page in between if necessary.
-    ///
-    /// ```example
-    /// #set page(height: 30pt)
-    ///
-    /// First.
-    /// #pagebreak(to: "odd")
-    /// Third.
-    /// ```
-    pub to: Option<Parity>,
 }
 
 /// Whether something should be even or odd.
@@ -719,7 +710,7 @@ pub enum Parity {
 
 impl Parity {
     /// Whether the given number matches the parity.
-    fn matches(self, number: usize) -> bool {
+    pub fn matches(self, number: usize) -> bool {
         match self {
             Self::Even => number % 2 == 0,
             Self::Odd => number % 2 == 1,
@@ -939,4 +930,15 @@ papers! {
     (NEWSPAPER_BROADSHEET: 381.0,    578.0, "newspaper-broadsheet")
     (PRESENTATION_16_9:    297.0, 167.0625, "presentation-16-9")
     (PRESENTATION_4_3:     280.0,    210.0, "presentation-4-3")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_paged_document_is_send_and_sync() {
+        fn ensure_send_and_sync<T: Send + Sync>() {}
+        ensure_send_and_sync::<PagedDocument>();
+    }
 }

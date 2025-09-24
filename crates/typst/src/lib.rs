@@ -12,166 +12,351 @@
 //!   the source file. The elements of the content tree are well structured and
 //!   order-independent and thus much better suited for further processing than
 //!   the raw markup.
-//! - **Typesetting:**
-//!   Next, the content is [typeset] into a [document] containing one [frame]
-//!   per page with items at fixed positions.
+//! - **Layouting:**
+//!   Next, the content is [laid out] into a [`PagedDocument`] containing one
+//!   [frame] per page with items at fixed positions.
 //! - **Exporting:**
-//!   These frames can finally be exported into an output format (currently
-//!   supported are [PDF] and [raster images]).
+//!   These frames can finally be exported into an output format (currently PDF,
+//!   PNG, SVG, and HTML).
 //!
-//! [tokens]: syntax::SyntaxKind
-//! [parsed]: syntax::parse
-//! [syntax tree]: syntax::SyntaxNode
-//! [AST]: syntax::ast
-//! [evaluate]: eval::eval
-//! [module]: eval::Module
-//! [content]: model::Content
-//! [typeset]: model::typeset
-//! [document]: doc::Document
-//! [frame]: doc::Frame
-//! [PDF]: export::pdf
-//! [raster images]: export::render
+//! [tokens]: typst_syntax::SyntaxKind
+//! [parsed]: typst_syntax::parse
+//! [syntax tree]: typst_syntax::SyntaxNode
+//! [AST]: typst_syntax::ast
+//! [evaluate]: typst_eval::eval
+//! [module]: crate::foundations::Module
+//! [content]: crate::foundations::Content
+//! [laid out]: typst_layout::layout_document
+//! [frame]: crate::layout::Frame
 
-#![recursion_limit = "1000"]
-#![allow(clippy::comparison_chain)]
+pub extern crate comemo;
+pub extern crate ecow;
 
-extern crate self as typst;
-
-#[macro_use]
-pub mod util;
-#[macro_use]
-pub mod eval;
-pub mod diag;
-pub mod doc;
-pub mod export;
-pub mod font;
-pub mod geom;
-pub mod image;
-pub mod model;
-
+pub use typst_library::*;
 #[doc(inline)]
 pub use typst_syntax as syntax;
+#[doc(inline)]
+pub use typst_utils as utils;
 
-use std::collections::HashSet;
-use std::ops::Range;
+use std::sync::LazyLock;
 
-use comemo::{Prehashed, Track, TrackedMut};
-use ecow::EcoString;
+use comemo::{Track, Tracked};
+use ecow::{EcoString, EcoVec, eco_format, eco_vec};
+use rustc_hash::FxHashSet;
+use typst_html::HtmlDocument;
+use typst_library::diag::{
+    FileError, SourceDiagnostic, SourceResult, Warned, bail, warning,
+};
+use typst_library::engine::{Engine, Route, Sink, Traced};
+use typst_library::foundations::{NativeRuleMap, StyleChain, Styles, Value};
+use typst_library::introspection::Introspector;
+use typst_library::layout::PagedDocument;
+use typst_library::routines::Routines;
+use typst_syntax::{FileId, Span};
+use typst_timing::{TimingScope, timed};
 
-use crate::diag::{FileResult, SourceResult};
-use crate::doc::Document;
-use crate::eval::{Bytes, Datetime, Library, Route, Tracer};
-use crate::font::{Font, FontBook};
-use crate::syntax::{FileId, PackageSpec, Source, Span};
+use crate::foundations::{Target, TargetElem};
+use crate::model::DocumentInfo;
 
-/// Compile a source file into a fully layouted document.
+/// Compile sources into a fully layouted document.
 ///
 /// - Returns `Ok(document)` if there were no fatal errors.
 /// - Returns `Err(errors)` if there were fatal errors.
-///
-/// Requires a mutable reference to a tracer. Such a tracer can be created with
-/// `Tracer::new()`. Independently of whether compilation succeeded, calling
-/// `tracer.warnings()` after compilation will return all compiler warnings.
-#[tracing::instrument(skip_all)]
-pub fn compile(world: &dyn World, tracer: &mut Tracer) -> SourceResult<Document> {
-    let route = Route::default();
+#[typst_macros::time]
+pub fn compile<D>(world: &dyn World) -> Warned<SourceResult<D>>
+where
+    D: Document,
+{
+    let mut sink = Sink::new();
+    let output = compile_impl::<D>(world.track(), Traced::default().track(), &mut sink)
+        .map_err(deduplicate);
+    Warned { output, warnings: sink.warnings() }
+}
 
-    // Call `track` just once to keep comemo's ID stable.
-    let world = world.track();
-    let mut tracer = tracer.track_mut();
+/// Compiles sources and returns all values and styles observed at the given
+/// `span` during compilation.
+#[typst_macros::time]
+pub fn trace<D>(world: &dyn World, span: Span) -> EcoVec<(Value, Option<Styles>)>
+where
+    D: Document,
+{
+    let mut sink = Sink::new();
+    let traced = Traced::new(span);
+    compile_impl::<D>(world.track(), traced.track(), &mut sink).ok();
+    sink.values()
+}
 
-    // Try to evaluate the source file into a module.
-    let module = eval::eval(
+/// The internal implementation of `compile` with a bit lower-level interface
+/// that is also used by `trace`.
+fn compile_impl<D: Document>(
+    world: Tracked<dyn World + '_>,
+    traced: Tracked<Traced>,
+    sink: &mut Sink,
+) -> SourceResult<D> {
+    if D::TARGET == Target::Html {
+        warn_or_error_for_html(world, sink)?;
+    }
+
+    let library = world.library();
+    let base = StyleChain::new(&library.styles);
+    let target = TargetElem::target.set(D::TARGET).wrap();
+    let styles = base.chain(&target);
+    let empty_introspector = Introspector::default();
+
+    // Fetch the main source file once.
+    let main = world.main();
+    let main = world
+        .source(main)
+        .map_err(|err| hint_invalid_main_file(world, err, main))?;
+
+    // First evaluate the main source file into a module.
+    let content = typst_eval::eval(
+        &ROUTINES,
         world,
-        route.track(),
-        TrackedMut::reborrow_mut(&mut tracer),
-        &world.main(),
-    );
+        traced,
+        sink.track_mut(),
+        Route::default().track(),
+        &main,
+    )?
+    .content();
 
-    // Try to typeset it.
-    let res = module.and_then(|module| model::typeset(world, tracer, &module.content()));
+    let mut iter = 0;
+    let mut subsink;
+    let mut introspector = &empty_introspector;
+    let mut document: D;
 
-    // Deduplicate errors.
-    res.map_err(|err| {
-        let mut unique = HashSet::new();
-        err.into_iter()
-            .filter(|diagnostic| {
-                let hash = util::hash128(&(&diagnostic.span, &diagnostic.message));
-                unique.insert(hash)
-            })
-            .collect()
-    })
+    // Relayout until all introspections stabilize.
+    // If that doesn't happen within five attempts, we give up.
+    loop {
+        // The name of the iterations for timing scopes.
+        const ITER_NAMES: &[&str] =
+            &["layout (1)", "layout (2)", "layout (3)", "layout (4)", "layout (5)"];
+        let _scope = TimingScope::new(ITER_NAMES[iter]);
+
+        subsink = Sink::new();
+
+        let constraint = comemo::Constraint::new();
+        let mut engine = Engine {
+            world,
+            introspector: introspector.track_with(&constraint),
+            traced,
+            sink: subsink.track_mut(),
+            route: Route::default(),
+            routines: &ROUTINES,
+        };
+
+        // Layout!
+        document = D::create(&mut engine, &content, styles)?;
+        introspector = document.introspector();
+        iter += 1;
+
+        if timed!("check stabilized", constraint.validate(introspector)) {
+            break;
+        }
+
+        if iter >= 5 {
+            subsink.warn(warning!(
+                Span::detached(), "layout did not converge within 5 attempts";
+                hint: "check if any states or queries are updating themselves"
+            ));
+            break;
+        }
+    }
+
+    sink.extend_from_sink(subsink);
+
+    // Promote delayed errors.
+    let delayed = sink.delayed();
+    if !delayed.is_empty() {
+        return Err(delayed);
+    }
+
+    Ok(document)
 }
 
-/// The environment in which typesetting occurs.
-///
-/// All loading functions (`main`, `source`, `file`, `font`) should perform
-/// internal caching so that they are relatively cheap on repeated invocations
-/// with the same argument. [`Source`], [`Bytes`], and [`Font`] are
-/// all reference-counted and thus cheap to clone.
-///
-/// The compiler doesn't do the caching itself because the world has much more
-/// information on when something can change. For example, fonts typically don't
-/// change and can thus even be cached across multiple compilations (for
-/// long-running applications like `typst watch`). Source files on the other
-/// hand can change and should thus be cleared after. Advanced clients like
-/// language servers can also retain the source files and [edit](Source::edit)
-/// them in-place to benefit from better incremental performance.
-#[comemo::track]
-pub trait World {
-    /// The standard library.
-    fn library(&self) -> &Prehashed<Library>;
+/// Deduplicate diagnostics.
+fn deduplicate(mut diags: EcoVec<SourceDiagnostic>) -> EcoVec<SourceDiagnostic> {
+    let mut unique = FxHashSet::default();
+    diags.retain(|diag| {
+        let hash = typst_utils::hash128(&(&diag.span, &diag.message));
+        unique.insert(hash)
+    });
+    diags
+}
 
-    /// Metadata about all known fonts.
-    fn book(&self) -> &Prehashed<FontBook>;
+/// Adds useful hints when the main source file couldn't be read
+/// and returns the final diagnostic.
+fn hint_invalid_main_file(
+    world: Tracked<dyn World + '_>,
+    file_error: FileError,
+    input: FileId,
+) -> EcoVec<SourceDiagnostic> {
+    let is_utf8_error = matches!(file_error, FileError::InvalidUtf8);
+    let mut diagnostic =
+        SourceDiagnostic::error(Span::detached(), EcoString::from(file_error));
 
-    /// Access the main source file.
-    fn main(&self) -> Source;
+    // Attempt to provide helpful hints for UTF-8 errors. Perhaps the user
+    // mistyped the filename. For example, they could have written "file.pdf"
+    // instead of "file.typ".
+    if is_utf8_error {
+        let path = input.vpath();
+        let extension = path.as_rootless_path().extension();
+        if extension.is_some_and(|extension| extension == "typ") {
+            // No hints if the file is already a .typ file.
+            // The file is indeed just invalid.
+            return eco_vec![diagnostic];
+        }
 
-    /// Try to access the specified source file.
-    ///
-    /// The returned `Source` file's [id](Source::id) does not have to match the
-    /// given `id`. Due to symlinks, two different file id's can point to the
-    /// same on-disk file. Implementors can deduplicate and return the same
-    /// `Source` if they want to, but do not have to.
-    fn source(&self, id: FileId) -> FileResult<Source>;
+        match extension {
+            Some(extension) => {
+                diagnostic.hint(eco_format!(
+                    "a file with the `.{}` extension is not usually a Typst file",
+                    extension.to_string_lossy()
+                ));
+            }
 
-    /// Try to access the specified file.
-    fn file(&self, id: FileId) -> FileResult<Bytes>;
+            None => {
+                diagnostic
+                    .hint("a file without an extension is not usually a Typst file");
+            }
+        };
 
-    /// Try to access the font with the given index in the font book.
-    fn font(&self, index: usize) -> Option<Font>;
+        if world.source(input.with_extension("typ")).is_ok() {
+            diagnostic.hint("check if you meant to use the `.typ` extension instead");
+        }
+    }
 
-    /// Get the current date.
-    ///
-    /// If no offset is specified, the local date should be chosen. Otherwise,
-    /// the UTC date should be chosen with the corresponding offset in hours.
-    ///
-    /// If this function returns `None`, Typst's `datetime` function will
-    /// return an error.
-    fn today(&self, offset: Option<i64>) -> Option<Datetime>;
+    eco_vec![diagnostic]
+}
 
-    /// A list of all available packages and optionally descriptions for them.
-    ///
-    /// This function is optional to implement. It enhances the user experience
-    /// by enabling autocompletion for packages. Details about packages from the
-    /// `@preview` namespace are available from
-    /// `https://packages.typst.org/preview/index.json`.
-    fn packages(&self) -> &[(PackageSpec, Option<EcoString>)] {
-        &[]
+/// HTML export will warn or error depending on whether the feature flag is enabled.
+fn warn_or_error_for_html(
+    world: Tracked<dyn World + '_>,
+    sink: &mut Sink,
+) -> SourceResult<()> {
+    const ISSUE: &str = "https://github.com/typst/typst/issues/5512";
+    if world.library().features.is_enabled(Feature::Html) {
+        sink.warn(warning!(
+            Span::detached(),
+            "html export is under active development and incomplete";
+            hint: "its behaviour may change at any time";
+            hint: "do not rely on this feature for production use cases";
+            hint: "see {ISSUE} for more information"
+        ));
+    } else {
+        bail!(
+            Span::detached(),
+            "html export is only available when `--features html` is passed";
+            hint: "html export is under active development and incomplete";
+            hint: "see {ISSUE} for more information"
+        );
+    }
+    Ok(())
+}
+
+/// A document is what results from compilation.
+pub trait Document: sealed::Sealed {
+    /// Get the document's metadata.
+    fn info(&self) -> &DocumentInfo;
+
+    /// Get the document's introspector.
+    fn introspector(&self) -> &Introspector;
+}
+
+impl Document for PagedDocument {
+    fn info(&self) -> &DocumentInfo {
+        &self.info
+    }
+
+    fn introspector(&self) -> &Introspector {
+        &self.introspector
     }
 }
 
-/// Helper methods on [`World`] implementations.
-pub trait WorldExt {
-    /// Get the byte range for a span.
-    ///
-    /// Returns `None` if the `Span` does not point into any source file.
-    fn range(&self, span: Span) -> Option<Range<usize>>;
-}
+impl Document for HtmlDocument {
+    fn info(&self) -> &DocumentInfo {
+        &self.info
+    }
 
-impl<T: World> WorldExt for T {
-    fn range(&self, span: Span) -> Option<Range<usize>> {
-        self.source(span.id()?).ok()?.range(span)
+    fn introspector(&self) -> &Introspector {
+        &self.introspector
     }
 }
+
+mod sealed {
+    use typst_library::foundations::{Content, Target};
+
+    use super::*;
+
+    pub trait Sealed: Sized {
+        const TARGET: Target;
+
+        fn create(
+            engine: &mut Engine,
+            content: &Content,
+            styles: StyleChain,
+        ) -> SourceResult<Self>;
+    }
+
+    impl Sealed for PagedDocument {
+        const TARGET: Target = Target::Paged;
+
+        fn create(
+            engine: &mut Engine,
+            content: &Content,
+            styles: StyleChain,
+        ) -> SourceResult<Self> {
+            typst_layout::layout_document(engine, content, styles)
+        }
+    }
+
+    impl Sealed for HtmlDocument {
+        const TARGET: Target = Target::Html;
+
+        fn create(
+            engine: &mut Engine,
+            content: &Content,
+            styles: StyleChain,
+        ) -> SourceResult<Self> {
+            typst_html::html_document(engine, content, styles)
+        }
+    }
+}
+
+/// Provides ways to construct a [`Library`].
+pub trait LibraryExt {
+    /// Creates the default library.
+    fn default() -> Library;
+
+    /// Creates a builder for configuring a library.
+    fn builder() -> LibraryBuilder;
+}
+
+impl LibraryExt for Library {
+    fn default() -> Library {
+        Self::builder().build()
+    }
+
+    fn builder() -> LibraryBuilder {
+        LibraryBuilder::from_routines(&ROUTINES)
+    }
+}
+
+/// Defines implementation of various Typst compiler routines as a table of
+/// function pointers.
+///
+/// This is essentially dynamic linking and done to allow for crate splitting.
+pub static ROUTINES: LazyLock<Routines> = LazyLock::new(|| Routines {
+    rules: {
+        let mut rules = NativeRuleMap::new();
+        typst_layout::register(&mut rules);
+        typst_html::register(&mut rules);
+        rules
+    },
+    eval_string: typst_eval::eval_string,
+    eval_closure: typst_eval::eval_closure,
+    realize: typst_realize::realize,
+    layout_frame: typst_layout::layout_frame,
+    html_module: typst_html::module,
+    html_span_filled: typst_html::html_span_filled,
+});

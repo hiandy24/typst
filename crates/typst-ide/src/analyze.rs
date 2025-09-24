@@ -1,72 +1,65 @@
 use comemo::Track;
-use ecow::{eco_vec, EcoString, EcoVec};
-use typst::doc::Frame;
-use typst::eval::{Route, Scopes, Tracer, Value, Vm};
-use typst::model::{DelayedErrors, Introspector, Label, Locator, Vt};
-use typst::syntax::{ast, LinkedNode, Span, SyntaxKind};
-use typst::World;
+use ecow::{EcoString, EcoVec, eco_vec};
+use rustc_hash::FxHashSet;
+use typst::foundations::{Label, Styles, Value};
+use typst::layout::PagedDocument;
+use typst::model::{BibliographyElem, FigureElem};
+use typst::syntax::{LinkedNode, SyntaxKind, ast};
+
+use crate::IdeWorld;
 
 /// Try to determine a set of possible values for an expression.
-pub fn analyze_expr(world: &dyn World, node: &LinkedNode) -> EcoVec<Value> {
-    match node.cast::<ast::Expr>() {
-        Some(ast::Expr::None(_)) => eco_vec![Value::None],
-        Some(ast::Expr::Auto(_)) => eco_vec![Value::Auto],
-        Some(ast::Expr::Bool(v)) => eco_vec![Value::Bool(v.get())],
-        Some(ast::Expr::Int(v)) => eco_vec![Value::Int(v.get())],
-        Some(ast::Expr::Float(v)) => eco_vec![Value::Float(v.get())],
-        Some(ast::Expr::Numeric(v)) => eco_vec![Value::numeric(v.get())],
-        Some(ast::Expr::Str(v)) => eco_vec![Value::Str(v.get().into())],
+pub fn analyze_expr(
+    world: &dyn IdeWorld,
+    node: &LinkedNode,
+) -> EcoVec<(Value, Option<Styles>)> {
+    let Some(expr) = node.cast::<ast::Expr>() else {
+        return eco_vec![];
+    };
 
-        Some(ast::Expr::FieldAccess(access)) => {
-            let Some(child) = node.children().next() else { return eco_vec![] };
-            analyze_expr(world, &child)
-                .into_iter()
-                .filter_map(|target| target.field(&access.field()).ok())
-                .collect()
-        }
-
-        Some(_) => {
-            if let Some(parent) = node.parent() {
-                if parent.kind() == SyntaxKind::FieldAccess && node.index() > 0 {
-                    return analyze_expr(world, parent);
-                }
+    let val = match expr {
+        ast::Expr::None(_) => Value::None,
+        ast::Expr::Auto(_) => Value::Auto,
+        ast::Expr::Bool(v) => Value::Bool(v.get()),
+        ast::Expr::Int(v) => Value::Int(v.get()),
+        ast::Expr::Float(v) => Value::Float(v.get()),
+        ast::Expr::Numeric(v) => Value::numeric(v.get()),
+        ast::Expr::Str(v) => Value::Str(v.get().into()),
+        _ => {
+            if node.kind() == SyntaxKind::Contextual
+                && let Some(child) = node.children().next_back()
+            {
+                return analyze_expr(world, &child);
             }
 
-            let mut tracer = Tracer::new();
-            tracer.inspect(node.span());
-            typst::compile(world, &mut tracer).ok();
-            tracer.values()
-        }
+            if let Some(parent) = node.parent()
+                && parent.kind() == SyntaxKind::FieldAccess
+                && node.index() > 0
+            {
+                return analyze_expr(world, parent);
+            }
 
-        _ => eco_vec![],
-    }
+            return typst::trace::<PagedDocument>(world.upcast(), node.span());
+        }
+    };
+
+    eco_vec![(val, None)]
 }
 
-/// Try to load a module from the current source file.
-pub fn analyze_import(world: &dyn World, source: &LinkedNode) -> Option<Value> {
-    let id = source.span().id()?;
-    let source = analyze_expr(world, source).into_iter().next()?;
+/// Tries to load a module from the given `source` node.
+pub fn analyze_import(world: &dyn IdeWorld, source: &LinkedNode) -> Option<Value> {
+    // Use span in the node for resolving imports with relative paths.
+    let source_span = source.span();
+    let (source, _) = analyze_expr(world, source).into_iter().next()?;
     if source.scope().is_some() {
         return Some(source);
     }
 
-    let mut locator = Locator::default();
-    let introspector = Introspector::default();
-    let mut delayed = DelayedErrors::new();
-    let mut tracer = Tracer::new();
-    let vt = Vt {
-        world: world.track(),
-        introspector: introspector.track(),
-        locator: &mut locator,
-        delayed: delayed.track_mut(),
-        tracer: tracer.track_mut(),
-    };
+    let Value::Str(path) = source else { return None };
 
-    let route = Route::default();
-    let mut vm = Vm::new(vt, route.track(), Some(id), Scopes::new(Some(world.library())));
-    typst::eval::import(&mut vm, source, Span::detached(), true)
-        .ok()
-        .map(Value::Module)
+    crate::utils::with_engine(world, |engine| {
+        typst_eval::import(engine, &path, source_span).ok().map(Value::Module)
+    })
 }
 
 /// Find all labels and details for them.
@@ -75,20 +68,31 @@ pub fn analyze_import(world: &dyn World, source: &LinkedNode) -> Option<Value> {
 /// - All labels and descriptions for them, if available
 /// - A split offset: All labels before this offset belong to nodes, all after
 ///   belong to a bibliography.
+///
+/// Note: When multiple labels in the document have the same identifier,
+/// this only returns the first one.
 pub fn analyze_labels(
-    world: &dyn World,
-    frames: &[Frame],
+    document: &PagedDocument,
 ) -> (Vec<(Label, Option<EcoString>)>, usize) {
     let mut output = vec![];
-    let introspector = Introspector::new(frames);
-    let items = &world.library().items;
+    let mut seen_labels = FxHashSet::default();
 
     // Labels in the document.
-    for elem in introspector.all() {
-        let Some(label) = elem.label().cloned() else { continue };
+    for elem in document.introspector.all() {
+        let Some(label) = elem.label() else { continue };
+        if !seen_labels.insert(label) {
+            continue;
+        }
+
         let details = elem
-            .field("caption")
-            .or_else(|| elem.field("body"))
+            .to_packed::<FigureElem>()
+            .and_then(|figure| match figure.caption.as_option() {
+                Some(Some(caption)) => Some(caption.pack_ref()),
+                _ => None,
+            })
+            .unwrap_or(elem)
+            .get_by_name("body")
+            .ok()
             .and_then(|field| match field {
                 Value::Content(content) => Some(content),
                 _ => None,
@@ -102,9 +106,7 @@ pub fn analyze_labels(
     let split = output.len();
 
     // Bibliography keys.
-    for (key, detail) in (items.bibliography_keys)(introspector.track()) {
-        output.push((Label(key), detail));
-    }
+    output.extend(BibliographyElem::keys(document.introspector.track()));
 
     (output, split)
 }

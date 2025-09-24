@@ -1,4 +1,7 @@
-use super::*;
+use crate::foundations::{Content, Func, Smart, cast, elem};
+use crate::layout::{Abs, Angle, Length, Ratio, Rel};
+use crate::math::Mathy;
+use crate::visualize::Stroke;
 
 /// Displays a diagonal line over a part of an equation.
 ///
@@ -11,7 +14,7 @@ use super::*;
 /// $ (a dot b dot cancel(x)) /
 ///     cancel(x) $
 /// ```
-#[elem(LayoutMath)]
+#[elem(Mathy)]
 pub struct CancelElem {
     /// The content over which the line should be placed.
     #[required]
@@ -53,13 +56,13 @@ pub struct CancelElem {
 
     /// How much to rotate the cancel line.
     ///
+    /// - If given an angle, the line is rotated by that angle clockwise with
+    ///   respect to the y-axis.
     /// - If `{auto}`, the line assumes the default angle; that is, along the
-    ///   diagonal line of the content box.
-    /// - If given an angle, the line is rotated by that angle clockwise w.r.t
-    ///   the y-axis.
-    /// - If given a function `angle => angle`, the line is rotated by the angle
-    ///   returned by that function. The function receives the default angle as
-    ///   its input.
+    ///   rising diagonal of the content box.
+    /// - If given a function `angle => angle`, the line is rotated, with
+    ///   respect to the y-axis, by the angle returned by that function. The
+    ///   function receives the default angle as its input.
     ///
     /// ```example
     /// >>> #set page(width: 140pt)
@@ -85,67 +88,17 @@ pub struct CancelElem {
     ///   ),
     /// ) $
     /// ```
-    #[resolve]
     #[fold]
     #[default(Stroke {
         // Default stroke has 0.5pt for better visuals.
-        thickness: Smart::Custom(Abs::pt(0.5)),
+        thickness: Smart::Custom(Abs::pt(0.5).into()),
         ..Default::default()
     })]
     pub stroke: Stroke,
 }
 
-impl LayoutMath for CancelElem {
-    fn layout_math(&self, ctx: &mut MathContext) -> SourceResult<()> {
-        let body = ctx.layout_fragment(&self.body())?;
-        // Use the same math class as the body, in order to preserve automatic spacing around it.
-        let body_class = body.class().unwrap_or(MathClass::Special);
-        let mut body = body.into_frame();
-
-        let styles = ctx.styles();
-        let body_size = body.size();
-        let span = self.span();
-        let length = self.length(styles).resolve(styles);
-
-        let stroke = self.stroke(styles).unwrap_or(FixedStroke {
-            paint: TextElem::fill_in(styles),
-            ..Default::default()
-        });
-
-        let invert = self.inverted(styles);
-        let cross = self.cross(styles);
-        let angle = self.angle(styles);
-
-        let invert_first_line = !cross && invert;
-        let first_line = draw_cancel_line(
-            ctx,
-            length,
-            stroke.clone(),
-            invert_first_line,
-            &angle,
-            body_size,
-            span,
-        )?;
-
-        // The origin of our line is the very middle of the element.
-        let center = body_size.to_point() / 2.0;
-        body.push_frame(center, first_line);
-
-        if cross {
-            // Draw the second line.
-            let second_line =
-                draw_cancel_line(ctx, length, stroke, true, &angle, body_size, span)?;
-
-            body.push_frame(center, second_line);
-        }
-
-        ctx.push(FrameFragment::new(ctx, body).with_class(body_class));
-
-        Ok(())
-    }
-}
-
 /// Defines the cancel line.
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum CancelAngle {
     Angle(Angle),
     Func(Func),
@@ -159,71 +112,4 @@ cast! {
     },
     v: Angle => CancelAngle::Angle(v),
     v: Func => CancelAngle::Func(v),
-}
-
-/// Draws a cancel line.
-fn draw_cancel_line(
-    ctx: &mut MathContext,
-    length_scale: Rel<Abs>,
-    stroke: FixedStroke,
-    invert: bool,
-    angle: &Smart<CancelAngle>,
-    body_size: Size,
-    span: Span,
-) -> SourceResult<Frame> {
-    let default = default_angle(body_size);
-    let mut angle = match angle {
-        // Non specified angle defaults to the diagonal
-        Smart::Auto => default,
-        Smart::Custom(angle) => match angle {
-            // This specifies the absolute angle w.r.t y-axis clockwise.
-            CancelAngle::Angle(v) => *v,
-            // This specifies a function that takes the default angle as input.
-            CancelAngle::Func(func) => {
-                func.call_vt(ctx.vt, [default])?.cast().at(span)?
-            }
-        },
-    };
-
-    // invert means flipping along the y-axis
-    if invert {
-        angle *= -1.0;
-    }
-
-    // same as above, the default length is the diagonal of the body box.
-    let default_length = body_size.to_point().hypot();
-    let length = length_scale.relative_to(default_length);
-
-    // Draw a vertical line of length and rotate it by angle
-    let start = Point::new(Abs::zero(), length / 2.0);
-    let delta = Point::new(Abs::zero(), -length);
-
-    let mut frame = Frame::soft(body_size);
-    frame.push(start, FrameItem::Shape(Geometry::Line(delta).stroked(stroke), span));
-
-    // Having the middle of the line at the origin is convenient here.
-    frame.transform(Transform::rotate(angle));
-    Ok(frame)
-}
-
-/// The default line angle for a body of the given size.
-fn default_angle(body: Size) -> Angle {
-    // The default cancel line is the diagonal.
-    // We infer the default angle from
-    // the diagonal w.r.t to the body box.
-    //
-    // The returned angle is in the range of [0, Pi/2]
-    //
-    // Note that the angle is computed w.r.t to the y-axis
-    //
-    //            B
-    //           /|
-    // diagonal / | height
-    //         /  |
-    //        /   |
-    //       O ----
-    //         width
-    let (width, height) = (body.x, body.y);
-    let default_angle = (width / height).atan(); // arctangent (in the range [0, Pi/2])
-    Angle::rad(default_angle)
 }

@@ -1,7 +1,7 @@
 use std::ops::Range;
 
-use super::{
-    is_newline, parse, reparse_block, reparse_markup, Span, SyntaxKind, SyntaxNode,
+use crate::{
+    Span, SyntaxKind, SyntaxNode, is_newline, parse, reparse_block, reparse_markup,
 };
 
 /// Refresh the given syntax node with as little parsing as possible.
@@ -11,7 +11,7 @@ use super::{
 /// ultimately reparsed.
 ///
 /// The high-level API for this function is
-/// [`Source::edit`](super::Source::edit).
+/// [`Source::edit`](crate::Source::edit).
 pub fn reparse(
     root: &mut SyntaxNode,
     text: &str,
@@ -70,13 +70,13 @@ fn try_reparse(
             }
 
             // If the child is a block, try to reparse the block.
-            if child.kind().is_block() {
-                if let Some(newborn) = reparse_block(text, new_range.clone()) {
-                    return node
-                        .replace_children(i..i + 1, vec![newborn])
-                        .is_ok()
-                        .then_some(new_range);
-                }
+            if child.kind().is_block()
+                && let Some(newborn) = reparse_block(text, new_range.clone())
+            {
+                return node
+                    .replace_children(i..i + 1, vec![newborn])
+                    .is_ok()
+                    .then_some(new_range);
             }
         }
 
@@ -157,19 +157,13 @@ fn try_reparse(
         let new_range = shifted..shifted + new_len;
         let at_end = end == children.len();
 
-        // Stop parsing early if this kind is encountered.
-        let stop_kind = match parent_kind {
-            Some(_) => SyntaxKind::RightBracket,
-            None => SyntaxKind::Eof,
-        };
-
         // Reparse!
         let reparsed = reparse_markup(
             text,
             new_range.clone(),
             &mut at_start,
             &mut nesting,
-            |kind| kind == stop_kind,
+            parent_kind.is_none(),
         );
 
         if let Some(newborns) = reparsed {
@@ -246,7 +240,7 @@ fn next_nesting(node: &SyntaxNode, nesting: &mut usize) {
 mod tests {
     use std::ops::Range;
 
-    use super::super::{parse, Source, Span};
+    use crate::{Source, Span, parse};
 
     #[track_caller]
     fn test(prev: &str, range: Range<usize>, with: &str, incremental: bool) {
@@ -265,10 +259,10 @@ mod tests {
             panic!("test failed");
         }
         if incremental {
-            assert_ne!(source.len_bytes(), range.len(), "should have been incremental");
+            assert_ne!(source.text().len(), range.len(), "should have been incremental");
         } else {
             assert_eq!(
-                source.len_bytes(),
+                source.text().len(),
                 range.len(),
                 "shouldn't have been incremental"
             );
@@ -301,6 +295,8 @@ mod tests {
         test("a\n#let \nb", 7..7, "i", true);
         test(r"#{{let x = z}; a = 1} b", 7..7, "//", false);
         test(r#"a ```typst hello```"#, 16..17, "", false);
+        test("a{b}c", 1..1, "#", false);
+        test("a#{b}c", 1..2, "", false);
     }
 
     #[test]

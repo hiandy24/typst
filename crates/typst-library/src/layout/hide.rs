@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::foundations::{Content, elem};
 
 /// Hides content without affecting layout.
 ///
@@ -12,16 +12,14 @@ use crate::prelude::*;
 /// Hello Jane \
 /// #hide[Hello] Joe
 /// ```
-#[elem(Show)]
+#[elem]
 pub struct HideElem {
     /// The content to hide.
     #[required]
     pub body: Content,
-}
 
-impl Show for HideElem {
-    #[tracing::instrument(name = "HideElem::show", skip(self))]
-    fn show(&self, _: &mut Vt, _: StyleChain) -> SourceResult<Content> {
-        Ok(self.body().styled(MetaElem::set_data(vec![Meta::Hide])))
-    }
+    /// This style is set on the content contained in the `hide` element.
+    #[internal]
+    #[ghost]
+    pub hidden: bool,
 }
