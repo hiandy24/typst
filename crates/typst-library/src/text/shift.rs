@@ -1,5 +1,8 @@
-use super::{variant, SpaceElem, TextElem, TextSize};
-use crate::prelude::*;
+use ttf_parser::Tag;
+
+use crate::foundations::{Content, Smart, elem};
+use crate::layout::{Em, Length};
+use crate::text::{FontMetrics, ScriptMetrics, TextSize};
 
 /// Renders text in subscript.
 ///
@@ -9,13 +12,18 @@ use crate::prelude::*;
 /// ```example
 /// Revenue#sub[yearly]
 /// ```
-#[elem(title = "Subscript", Show)]
+#[elem(title = "Subscript")]
 pub struct SubElem {
-    /// Whether to prefer the dedicated subscript characters of the font.
+    /// Whether to use subscript glyphs from the font if available.
     ///
-    /// If this is enabled, Typst first tries to transform the text to subscript
-    /// codepoints. If that fails, it falls back to rendering lowered and shrunk
-    /// normal letters.
+    /// Ideally, subscripts glyphs are provided by the font (using the `subs`
+    /// OpenType feature). Otherwise, Typst is able to synthesize subscripts by
+    /// lowering and scaling down regular glyphs.
+    ///
+    /// When this is set to `{false}`, synthesized glyphs will be used
+    /// regardless of whether the font provides dedicated subscript glyphs. When
+    /// `{true}`, synthesized glyphs may still be used in case the font does not
+    /// provide the necessary subscript glyphs.
     ///
     /// ```example
     /// N#sub(typographic: true)[1]
@@ -24,41 +32,31 @@ pub struct SubElem {
     #[default(true)]
     pub typographic: bool,
 
-    /// The baseline shift for synthetic subscripts. Does not apply if
-    /// `typographic` is true and the font has subscript codepoints for the
-    /// given `body`.
-    #[default(Em::new(0.2).into())]
-    pub baseline: Length,
+    /// The downward baseline shift for synthesized subscripts.
+    ///
+    /// This only applies to synthesized subscripts. In other words, this has no
+    /// effect if `typographic` is `{true}` and the font provides the necessary
+    /// subscript glyphs.
+    ///
+    /// If set to `{auto}`, the baseline is shifted according to the metrics
+    /// provided by the font, with a fallback to `{0.2em}` in case the font does
+    /// not define the necessary metrics.
+    pub baseline: Smart<Length>,
 
-    /// The font size for synthetic subscripts. Does not apply if
-    /// `typographic` is true and the font has subscript codepoints for the
-    /// given `body`.
-    #[default(TextSize(Em::new(0.6).into()))]
-    pub size: TextSize,
+    /// The font size for synthesized subscripts.
+    ///
+    /// This only applies to synthesized subscripts. In other words, this has no
+    /// effect if `typographic` is `{true}` and the font provides the necessary
+    /// subscript glyphs.
+    ///
+    /// If set to `{auto}`, the size is scaled according to the metrics provided
+    /// by the font, with a fallback to `{0.6em}` in case the font does not
+    /// define the necessary metrics.
+    pub size: Smart<TextSize>,
 
     /// The text to display in subscript.
     #[required]
     pub body: Content,
-}
-
-impl Show for SubElem {
-    #[tracing::instrument(name = "SubElem::show", skip_all)]
-    fn show(&self, vt: &mut Vt, styles: StyleChain) -> SourceResult<Content> {
-        let body = self.body();
-        let mut transformed = None;
-        if self.typographic(styles) {
-            if let Some(text) = search_text(&body, true) {
-                if is_shapable(vt, &text, styles) {
-                    transformed = Some(TextElem::packed(text));
-                }
-            }
-        };
-
-        Ok(transformed.unwrap_or_else(|| {
-            body.styled(TextElem::set_baseline(self.baseline(styles)))
-                .styled(TextElem::set_size(self.size(styles)))
-        }))
-    }
 }
 
 /// Renders text in superscript.
@@ -69,13 +67,18 @@ impl Show for SubElem {
 /// ```example
 /// 1#super[st] try!
 /// ```
-#[elem(title = "Superscript", Show)]
+#[elem(title = "Superscript")]
 pub struct SuperElem {
-    /// Whether to prefer the dedicated superscript characters of the font.
+    /// Whether to use superscript glyphs from the font if available.
     ///
-    /// If this is enabled, Typst first tries to transform the text to
-    /// superscript codepoints. If that fails, it falls back to rendering
-    /// raised and shrunk normal letters.
+    /// Ideally, superscripts glyphs are provided by the font (using the `sups`
+    /// OpenType feature). Otherwise, Typst is able to synthesize superscripts
+    /// by raising and scaling down regular glyphs.
+    ///
+    /// When this is set to `{false}`, synthesized glyphs will be used
+    /// regardless of whether the font provides dedicated superscript glyphs.
+    /// When `{true}`, synthesized glyphs may still be used in case the font
+    /// does not provide the necessary superscript glyphs.
     ///
     /// ```example
     /// N#super(typographic: true)[1]
@@ -84,140 +87,105 @@ pub struct SuperElem {
     #[default(true)]
     pub typographic: bool,
 
-    /// The baseline shift for synthetic superscripts. Does not apply if
-    /// `typographic` is true and the font has superscript codepoints for the
-    /// given `body`.
-    #[default(Em::new(-0.5).into())]
-    pub baseline: Length,
+    /// The downward baseline shift for synthesized superscripts.
+    ///
+    /// This only applies to synthesized superscripts. In other words, this has
+    /// no effect if `typographic` is `{true}` and the font provides the
+    /// necessary superscript glyphs.
+    ///
+    /// If set to `{auto}`, the baseline is shifted according to the metrics
+    /// provided by the font, with a fallback to `{-0.5em}` in case the font
+    /// does not define the necessary metrics.
+    ///
+    /// Note that, since the baseline shift is applied downward, you will need
+    /// to provide a negative value for the content to appear as raised above
+    /// the normal baseline.
+    pub baseline: Smart<Length>,
 
-    /// The font size for synthetic superscripts. Does not apply if
-    /// `typographic` is true and the font has superscript codepoints for the
-    /// given `body`.
-    #[default(TextSize(Em::new(0.6).into()))]
-    pub size: TextSize,
+    /// The font size for synthesized superscripts.
+    ///
+    /// This only applies to synthesized superscripts. In other words, this has
+    /// no effect if `typographic` is `{true}` and the font provides the
+    /// necessary superscript glyphs.
+    ///
+    /// If set to `{auto}`, the size is scaled according to the metrics provided
+    /// by the font, with a fallback to `{0.6em}` in case the font does not
+    /// define the necessary metrics.
+    pub size: Smart<TextSize>,
 
     /// The text to display in superscript.
     #[required]
     pub body: Content,
 }
 
-impl Show for SuperElem {
-    #[tracing::instrument(name = "SuperElem::show", skip_all)]
-    fn show(&self, vt: &mut Vt, styles: StyleChain) -> SourceResult<Content> {
-        let body = self.body();
-        let mut transformed = None;
-        if self.typographic(styles) {
-            if let Some(text) = search_text(&body, false) {
-                if is_shapable(vt, &text, styles) {
-                    transformed = Some(TextElem::packed(text));
-                }
-            }
-        };
-
-        Ok(transformed.unwrap_or_else(|| {
-            body.styled(TextElem::set_baseline(self.baseline(styles)))
-                .styled(TextElem::set_size(self.size(styles)))
-        }))
-    }
+/// Configuration values for sub- or superscript text.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct ShiftSettings {
+    /// Whether the OpenType feature should be used if possible.
+    pub typographic: bool,
+    /// The baseline shift of the script, relative to the outer text size.
+    ///
+    /// For superscripts, this is positive. For subscripts, this is negative. A
+    /// value of [`Smart::Auto`] indicates that the value should be obtained
+    /// from font metrics.
+    pub shift: Smart<Em>,
+    /// The size of the script, relative to the outer text size.
+    ///
+    /// A value of [`Smart::Auto`] indicates that the value should be obtained
+    /// from font metrics.
+    pub size: Smart<Em>,
+    /// The kind of script (either a subscript, or a superscript).
+    ///
+    /// This is used to know which OpenType table to use to resolve
+    /// [`Smart::Auto`] values.
+    pub kind: ScriptKind,
 }
 
-/// Find and transform the text contained in `content` to the given script kind
-/// if and only if it only consists of `Text`, `Space`, and `Empty` leafs.
-fn search_text(content: &Content, sub: bool) -> Option<EcoString> {
-    if content.is::<SpaceElem>() {
-        Some(' '.into())
-    } else if let Some(elem) = content.to::<TextElem>() {
-        convert_script(&elem.text(), sub)
-    } else if let Some(children) = content.to_sequence() {
-        let mut full = EcoString::new();
-        for item in children {
-            match search_text(item, sub) {
-                Some(text) => full.push_str(&text),
-                None => return None,
-            }
-        }
-        Some(full)
-    } else {
-        None
-    }
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum ScriptKind {
+    Sub,
+    Super,
 }
 
-/// Checks whether the first retrievable family contains all code points of the
-/// given string.
-fn is_shapable(vt: &Vt, text: &str, styles: StyleChain) -> bool {
-    let world = vt.world;
-    for family in TextElem::font_in(styles) {
-        if let Some(font) = world
-            .book()
-            .select(family.as_str(), variant(styles))
-            .and_then(|id| world.font(id))
-        {
-            return text.chars().all(|c| font.ttf().glyph_index(c).is_some());
+impl ScriptKind {
+    /// Returns the default metrics for this script kind.
+    ///
+    /// This can be used as a last resort if neither the user nor the font
+    /// provided those metrics.
+    pub fn default_metrics(self) -> &'static ScriptMetrics {
+        match self {
+            Self::Sub => &DEFAULT_SUBSCRIPT_METRICS,
+            Self::Super => &DEFAULT_SUPERSCRIPT_METRICS,
         }
     }
 
-    false
-}
-
-/// Convert a string to sub- or superscript codepoints if all characters
-/// can be mapped to such a codepoint.
-fn convert_script(text: &str, sub: bool) -> Option<EcoString> {
-    let mut result = EcoString::with_capacity(text.len());
-    let converter = if sub { to_subscript_codepoint } else { to_superscript_codepoint };
-
-    for c in text.chars() {
-        match converter(c) {
-            Some(c) => result.push(c),
-            None => return None,
+    /// Reads the script metrics from the font table for to this script kind.
+    pub fn read_metrics(self, font_metrics: &FontMetrics) -> &ScriptMetrics {
+        match self {
+            Self::Sub => font_metrics.subscript.as_ref(),
+            Self::Super => font_metrics.superscript.as_ref(),
         }
+        .unwrap_or(self.default_metrics())
     }
 
-    Some(result)
+    /// The corresponding OpenType feature.
+    pub const fn feature(self) -> Tag {
+        match self {
+            Self::Sub => Tag::from_bytes(b"subs"),
+            Self::Super => Tag::from_bytes(b"sups"),
+        }
+    }
 }
+pub static DEFAULT_SUBSCRIPT_METRICS: ScriptMetrics = ScriptMetrics {
+    width: Em::new(0.6),
+    height: Em::new(0.6),
+    horizontal_offset: Em::zero(),
+    vertical_offset: Em::new(-0.2),
+};
 
-/// Convert a character to its corresponding Unicode superscript.
-fn to_superscript_codepoint(c: char) -> Option<char> {
-    char::from_u32(match c {
-        '0' => 0x2070,
-        '1' => 0x00B9,
-        '2' => 0x00B2,
-        '3' => 0x00B3,
-        '4'..='9' => 0x2070 + (c as u32 + 4 - '4' as u32),
-        '+' => 0x207A,
-        '-' => 0x207B,
-        '=' => 0x207C,
-        '(' => 0x207D,
-        ')' => 0x207E,
-        'n' => 0x207F,
-        'i' => 0x2071,
-        ' ' => 0x0020,
-        _ => return None,
-    })
-}
-
-/// Convert a character to its corresponding Unicode subscript.
-fn to_subscript_codepoint(c: char) -> Option<char> {
-    char::from_u32(match c {
-        '0' => 0x2080,
-        '1'..='9' => 0x2080 + (c as u32 - '0' as u32),
-        '+' => 0x208A,
-        '-' => 0x208B,
-        '=' => 0x208C,
-        '(' => 0x208D,
-        ')' => 0x208E,
-        'a' => 0x2090,
-        'e' => 0x2091,
-        'o' => 0x2092,
-        'x' => 0x2093,
-        'h' => 0x2095,
-        'k' => 0x2096,
-        'l' => 0x2097,
-        'm' => 0x2098,
-        'n' => 0x2099,
-        'p' => 0x209A,
-        's' => 0x209B,
-        't' => 0x209C,
-        ' ' => 0x0020,
-        _ => return None,
-    })
-}
+pub static DEFAULT_SUPERSCRIPT_METRICS: ScriptMetrics = ScriptMetrics {
+    width: Em::new(0.6),
+    height: Em::new(0.6),
+    horizontal_offset: Em::zero(),
+    vertical_offset: Em::new(0.5),
+};

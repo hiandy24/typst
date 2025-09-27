@@ -8,18 +8,11 @@ mod cast;
 mod elem;
 mod func;
 mod scope;
-mod symbols;
+mod time;
 mod ty;
 
 use proc_macro::TokenStream as BoundaryStream;
-use proc_macro2::TokenStream;
-use quote::quote;
-use syn::ext::IdentExt;
-use syn::parse::{Parse, ParseStream, Parser};
-use syn::punctuated::Punctuated;
-use syn::{parse_quote, DeriveInput, Ident, Result, Token};
-
-use self::util::*;
+use syn::DeriveInput;
 
 /// Makes a native Rust function usable as a Typst function.
 ///
@@ -45,10 +38,14 @@ use self::util::*;
 /// You can customize some properties of the resulting function:
 /// - `scope`: Indicates that the function has an associated scope defined by
 ///   the `#[scope]` macro.
-/// - `name`: The functions's normal name (e.g. `min`). Defaults to the Rust
-///   name in kebab-case.
+/// - `contextual`: Indicates that the function makes use of context. This has
+///   no effect on the behaviour itself, but is used for the docs.
+/// - `name`: The functions's normal name (e.g. `min`), as exposed to Typst.
+///   Defaults to the Rust name in kebab-case.
 /// - `title`: The functions's title case name (e.g. `Minimum`). Defaults to the
 ///   normal name in title case.
+/// - `keywords = [..]`: A list of alternate search terms for this function.
+/// - `constructor`: Indicates that the function is a constructor.
 ///
 /// # Arguments
 /// By default, function arguments are positional and required. You can use
@@ -94,6 +91,15 @@ use self::util::*;
 /// in the documentation. The first line of documentation should be concise and
 /// self-contained as it is the designated short description, which is used in
 /// overviews in the documentation (and for autocompletion).
+///
+/// Additionally, some arguments are treated specially by this macro:
+///
+/// - `engine`: The compilation context (`Engine`).
+/// - `context`: The introspection context (`Tracked<Context>`).
+/// - `args`: The rest of the arguments passed into this function (`&mut Args`).
+/// - `span`: The span of the function call (`Span`).
+///
+/// These should always come after `self`, in the order specified.
 #[proc_macro_attribute]
 pub fn func(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
     let item = syn::parse_macro_input!(item as syn::ItemFn);
@@ -121,8 +127,10 @@ pub fn func(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
 /// You can customize some properties of the resulting type:
 /// - `scope`: Indicates that the type has an associated scope defined by the
 ///   `#[scope]` macro
-/// - `name`: The type's normal name (e.g. `str`). Defaults to the Rust name in
-///   kebab-case.
+/// - `cast`: Indicates that the type has a custom `cast!` implementation.
+///   The macro will then not autogenerate one.
+/// - `name`: The type's normal name (e.g. `str`), as exposed to Typst.
+///   Defaults to the Rust name in kebab-case.
 /// - `title`: The type's title case name (e.g. `String`). Defaults to the
 ///   normal name in title case.
 #[proc_macro_attribute]
@@ -137,7 +145,7 @@ pub fn ty(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
 ///
 /// This implements `NativeElement` for the given type.
 ///
-/// ```
+/// ```ignore
 /// /// A section heading.
 /// #[elem(Show, Count)]
 /// struct HeadingElem {
@@ -154,11 +162,13 @@ pub fn ty(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
 /// # Properties
 /// You can customize some properties of the resulting type:
 /// - `scope`: Indicates that the type has an associated scope defined by the
-///   `#[scope]` macro
-/// - `name`: The element's normal name (e.g. `str`). Defaults to the Rust name
-///   in kebab-case.
-/// - `title`: The type's title case name (e.g. `String`). Defaults to the long
+///   `#[scope]` macro.
+/// - `name = "<name>"`: The element's normal name (e.g. `align`), as exposed to Typst.
+///   Defaults to the Rust name in kebab-case.
+/// - `title = "<title>"`: The type's title case name (e.g. `Align`). Defaults to the long
 ///   name in title case.
+/// - `keywords = [..]`: A list of alternate search terms for this element.
+///   Defaults to the empty list.
 /// - The remaining entries in the `elem` macros list are traits the element
 ///   is capable of. These can be dynamically accessed.
 ///
@@ -182,6 +192,9 @@ pub fn ty(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
 ///   are folded together into one. E.g. `set rect(stroke: 2pt)` and
 ///   `set rect(stroke: red)` are combined into the equivalent of
 ///   `set rect(stroke: 2pt + red)` instead of having `red` override `2pt`.
+/// - `#[borrowed]`: For fields that are accessed through the style chain,
+///   indicates that accessor methods to this field should return references
+///   to the value instead of cloning.
 /// - `#[internal]`: The field does not appear in the documentation.
 /// - `#[external]`: The field appears in the documentation, but is otherwise
 ///   ignored. Can be useful if you want to do something manually for more
@@ -189,6 +202,13 @@ pub fn ty(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
 /// - `#[synthesized]`: The field cannot be specified in a constructor or set
 ///   rule. Instead, it is added to an element before its show rule runs
 ///   through the `Synthesize` trait.
+/// - `#[ghost]`: Allows creating fields that are only present in the style chain,
+///   this means that they *cannot* be accessed by the user, they cannot be set
+///   on an individual instantiated element, and must be set via the style chain.
+///   This is useful for fields that are only used internally by the style chain,
+///   such as the fields from `ParElem` and `TextElem`. If your element contains
+///   any ghost fields, then you cannot auto-generate `Construct` for it, and
+///   you must implement `Construct` manually.
 #[proc_macro_attribute]
 pub fn elem(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
     let item = syn::parse_macro_input!(item as syn::ItemStruct);
@@ -250,7 +270,7 @@ pub fn scope(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
 /// - `Reflect` makes Typst's runtime aware of the type's characteristics.
 ///   It's important for autocompletion, error messages, etc.
 /// - `FromValue` defines how to cast from a value into this type.
-/// - `IntoValue` defines how to cast fromthis type into a value.
+/// - `IntoValue` defines how to cast from this type into a value.
 ///
 /// ```ignore
 /// /// An integer between 0 and 13.
@@ -307,28 +327,42 @@ pub fn derive_cast(item: BoundaryStream) -> BoundaryStream {
         .into()
 }
 
-/// Defines a list of `Symbol`s.
+/// Times function invocations.
+///
+/// When tracing is enabled in the typst-cli, this macro will record the
+/// invocations of the function and store them in a global map. The map can be
+/// accessed through the `typst_trace::RECORDER` static.
+///
+/// You can also specify the span of the function invocation:
+/// - `#[time(span = ..)]` to record the span, which will be used for the
+///   `EventKey`.
+///
+/// By default, all tracing is omitted using the `wasm32` target flag.
+/// This is done to avoid bloating the web app, which doesn't need tracing.
 ///
 /// ```ignore
-/// const EMOJI: &[(&str, Symbol)] = symbols! {
-///    // A plain symbol without modifiers.
-///    abacus: '🧮',
+/// #[time]
+/// fn fibonacci(n: u64) -> u64 {
+///     if n <= 1 {
+///         1
+///     } else {
+///         fibonacci(n - 1) + fibonacci(n - 2)
+///     }
+/// }
 ///
-///    // A symbol with a modifierless default and one modifier.
-///    alien: ['👽', monster: '👾'],
-///
-///    // A symbol where each variant has a modifier. The first one will be
-///    // the default.
-///    clock: [one: '🕐', two: '🕑', ...],
+/// #[time(span = span)]
+/// fn fibonacci_spanned(n: u64, span: Span) -> u64 {
+///     if n <= 1 {
+///         1
+///     } else {
+///         fibonacci(n - 1) + fibonacci(n - 2)
+///     }
 /// }
 /// ```
-///
-/// _Note:_ While this could use `macro_rules!` instead of a proc-macro, it was
-/// horribly slow in rust-analyzer. The underlying cause might be
-/// [this issue](https://github.com/rust-lang/rust-analyzer/issues/11108).
-#[proc_macro]
-pub fn symbols(stream: BoundaryStream) -> BoundaryStream {
-    symbols::symbols(stream.into())
+#[proc_macro_attribute]
+pub fn time(stream: BoundaryStream, item: BoundaryStream) -> BoundaryStream {
+    let item = syn::parse_macro_input!(item as syn::ItemFn);
+    time::time(stream.into(), item)
         .unwrap_or_else(|err| err.to_compile_error())
         .into()
 }

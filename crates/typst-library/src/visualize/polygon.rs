@@ -1,6 +1,10 @@
 use std::f64::consts::PI;
 
-use crate::prelude::*;
+use typst_syntax::Span;
+
+use crate::foundations::{Content, NativeElement, Smart, elem, func, scope};
+use crate::layout::{Axes, Em, Length, Rel};
+use crate::visualize::{FillRule, Paint, Stroke};
 
 /// A closed polygon.
 ///
@@ -17,22 +21,24 @@ use crate::prelude::*;
 ///   (0%,  2cm),
 /// )
 /// ```
-#[elem(scope, Layout)]
+#[elem(scope)]
 pub struct PolygonElem {
     /// How to fill the polygon.
     ///
     /// When setting a fill, the default stroke disappears. To create a
     /// rectangle with both fill and stroke, you have to configure both.
-    ///
-    /// Currently all polygons are filled according to the
-    /// [non-zero winding rule](https://en.wikipedia.org/wiki/Nonzero-rule).
     pub fill: Option<Paint>,
 
-    /// How to [stroke]($stroke) the polygon. This can be:
+    /// The drawing rule used to fill the polygon.
+    ///
+    /// See the [curve documentation]($curve.fill-rule) for an example.
+    #[default]
+    pub fill_rule: FillRule,
+
+    /// How to [stroke] the polygon.
     ///
     /// Can be set to  `{none}` to disable the stroke or to `{auto}` for a
-    /// stroke of `{1pt}` black if and if only if no fill is given.
-    #[resolve]
+    /// stroke of `{1pt}` black if and only if no fill is given.
     #[fold]
     pub stroke: Smart<Option<Stroke>>,
 
@@ -56,6 +62,8 @@ impl PolygonElem {
     /// ```
     #[func(title = "Regular Polygon")]
     pub fn regular(
+        span: Span,
+
         /// How to fill the polygon. See the general
         /// [polygon's documentation]($polygon.fill) for more details.
         #[named]
@@ -104,61 +112,11 @@ impl PolygonElem {
 
         let mut elem = PolygonElem::new(vertices);
         if let Some(fill) = fill {
-            elem.push_fill(fill);
+            elem.fill.set(fill);
         }
         if let Some(stroke) = stroke {
-            elem.push_stroke(stroke);
+            elem.stroke.set(stroke);
         }
-        elem.pack()
-    }
-}
-
-impl Layout for PolygonElem {
-    #[tracing::instrument(name = "PolygonElem::layout", skip_all)]
-    fn layout(
-        &self,
-        _: &mut Vt,
-        styles: StyleChain,
-        regions: Regions,
-    ) -> SourceResult<Fragment> {
-        let points: Vec<Point> = self
-            .vertices()
-            .iter()
-            .map(|c| {
-                c.resolve(styles).zip_map(regions.base(), Rel::relative_to).to_point()
-            })
-            .collect();
-
-        let size = points.iter().fold(Point::zero(), |max, c| c.max(max)).to_size();
-        if !size.is_finite() {
-            bail!(error!(self.span(), "cannot create polygon with infinite size"));
-        }
-        let mut frame = Frame::hard(size);
-
-        // Only create a path if there are more than zero points.
-        if points.is_empty() {
-            return Ok(Fragment::frame(frame));
-        }
-
-        // Prepare fill and stroke.
-        let fill = self.fill(styles);
-        let stroke = match self.stroke(styles) {
-            Smart::Auto if fill.is_none() => Some(FixedStroke::default()),
-            Smart::Auto => None,
-            Smart::Custom(stroke) => stroke.map(Stroke::unwrap_or_default),
-        };
-
-        // Construct a closed path given all points.
-        let mut path = Path::new();
-        path.move_to(points[0]);
-        for &point in &points[1..] {
-            path.line_to(point);
-        }
-        path.close_path();
-
-        let shape = Shape { geometry: Geometry::Path(path), stroke, fill };
-        frame.push(Point::zero(), FrameItem::Shape(shape, self.span()));
-
-        Ok(Fragment::frame(frame))
+        elem.pack().spanned(span)
     }
 }

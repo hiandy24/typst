@@ -1,4 +1,4 @@
-use crate::{ast, LinkedNode, SyntaxKind, SyntaxNode};
+use crate::{LinkedNode, SyntaxKind, SyntaxNode, ast};
 
 /// A syntax highlighting tag.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -153,6 +153,9 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Strong => Some(Tag::Strong),
         SyntaxKind::Emph => Some(Tag::Emph),
         SyntaxKind::Raw => Some(Tag::Raw),
+        SyntaxKind::RawLang => None,
+        SyntaxKind::RawTrimmed => None,
+        SyntaxKind::RawDelim => None,
         SyntaxKind::Link => Some(Tag::Link),
         SyntaxKind::Label => Some(Tag::Label),
         SyntaxKind::Ref => Some(Tag::Ref),
@@ -168,7 +171,9 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Equation => None,
 
         SyntaxKind::Math => None,
+        SyntaxKind::MathText => None,
         SyntaxKind::MathIdent => highlight_ident(node),
+        SyntaxKind::MathShorthand => Some(Tag::Escape),
         SyntaxKind::MathAlignPoint => Some(Tag::MathOperator),
         SyntaxKind::MathDelimited => None,
         SyntaxKind::MathAttach => None,
@@ -230,6 +235,7 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Let => Some(Tag::Keyword),
         SyntaxKind::Set => Some(Tag::Keyword),
         SyntaxKind::Show => Some(Tag::Keyword),
+        SyntaxKind::Context => Some(Tag::Keyword),
         SyntaxKind::If => Some(Tag::Keyword),
         SyntaxKind::Else => Some(Tag::Keyword),
         SyntaxKind::For => Some(Tag::Keyword),
@@ -267,11 +273,13 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::LetBinding => None,
         SyntaxKind::SetRule => None,
         SyntaxKind::ShowRule => None,
+        SyntaxKind::Contextual => None,
         SyntaxKind::Conditional => None,
         SyntaxKind::WhileLoop => None,
         SyntaxKind::ForLoop => None,
         SyntaxKind::ModuleImport => None,
         SyntaxKind::ImportItems => None,
+        SyntaxKind::ImportItemPath => None,
         SyntaxKind::RenamedImportItem => None,
         SyntaxKind::ModuleInclude => None,
         SyntaxKind::LoopBreak => None,
@@ -280,10 +288,11 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
         SyntaxKind::Destructuring => None,
         SyntaxKind::DestructAssignment => None,
 
+        SyntaxKind::Shebang => Some(Tag::Comment),
         SyntaxKind::LineComment => Some(Tag::Comment),
         SyntaxKind::BlockComment => Some(Tag::Comment),
         SyntaxKind::Error => Some(Tag::Error),
-        SyntaxKind::Eof => None,
+        SyntaxKind::End => None,
     }
 }
 
@@ -291,18 +300,14 @@ pub fn highlight(node: &LinkedNode) -> Option<Tag> {
 fn highlight_ident(node: &LinkedNode) -> Option<Tag> {
     // Are we directly before an argument list?
     let next_leaf = node.next_leaf();
-    if let Some(next) = &next_leaf {
-        if node.range().end == next.offset()
-            && ((next.kind() == SyntaxKind::LeftParen
-                && matches!(
-                    next.parent_kind(),
-                    Some(SyntaxKind::Args | SyntaxKind::Params)
-                ))
-                || (next.kind() == SyntaxKind::LeftBracket
-                    && next.parent_kind() == Some(SyntaxKind::ContentBlock)))
-        {
-            return Some(Tag::Function);
-        }
+    if let Some(next) = &next_leaf
+        && node.range().end == next.offset()
+        && ((next.kind() == SyntaxKind::LeftParen
+            && matches!(next.parent_kind(), Some(SyntaxKind::Args | SyntaxKind::Params)))
+            || (next.kind() == SyntaxKind::LeftBracket
+                && next.parent_kind() == Some(SyntaxKind::ContentBlock)))
+    {
+        return Some(Tag::Function);
     }
 
     // Are we in math?
@@ -370,13 +375,13 @@ pub fn highlight_html(root: &SyntaxNode) -> String {
 /// Highlight one source node, emitting HTML.
 fn highlight_html_impl(html: &mut String, node: &LinkedNode) {
     let mut span = false;
-    if let Some(tag) = highlight(node) {
-        if tag != Tag::Error {
-            span = true;
-            html.push_str("<span class=\"");
-            html.push_str(tag.css_class());
-            html.push_str("\">");
-        }
+    if let Some(tag) = highlight(node)
+        && tag != Tag::Error
+    {
+        span = true;
+        html.push_str("<span class=\"");
+        html.push_str(tag.css_class());
+        html.push_str("\">");
     }
 
     let text = node.text();

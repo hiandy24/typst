@@ -1,99 +1,38 @@
-use super::*;
-
-/// How much less high scaled delimiters can be than what they wrap.
-pub(super) const DELIM_SHORT_FALL: Em = Em::new(0.1);
+use crate::foundations::{Content, NativeElement, SymbolElem, elem, func};
+use crate::layout::{Length, Rel};
+use crate::math::Mathy;
 
 /// Scales delimiters.
 ///
 /// While matched delimiters scale by default, this can be used to scale
 /// unmatched delimiters and to control the delimiter scaling more precisely.
-#[elem(title = "Left/Right", LayoutMath)]
+#[elem(title = "Left/Right", Mathy)]
 pub struct LrElem {
     /// The size of the brackets, relative to the height of the wrapped content.
-    pub size: Smart<Rel<Length>>,
+    #[default(Rel::one())]
+    pub size: Rel<Length>,
 
     /// The delimited content, including the delimiters.
     #[required]
     #[parse(
-        let mut body = Content::empty();
-        for (i, arg) in args.all::<Content>()?.into_iter().enumerate() {
-            if i > 0 {
-                body += TextElem::packed(',');
-            }
-            body += arg;
-        }
+        let mut arguments = args.all::<Content>()?.into_iter();
+        let mut body = arguments.next().unwrap_or_default();
+        arguments.for_each(|arg| body += SymbolElem::packed(',') + arg);
         body
     )]
     pub body: Content,
 }
 
-impl LayoutMath for LrElem {
-    #[tracing::instrument(skip(ctx))]
-    fn layout_math(&self, ctx: &mut MathContext) -> SourceResult<()> {
-        let mut body = self.body();
-        if let Some(elem) = body.to::<LrElem>() {
-            if elem.size(ctx.styles()).is_auto() {
-                body = elem.body();
-            }
-        }
-
-        let mut fragments = ctx.layout_fragments(&body)?;
-        let axis = scaled!(ctx, axis_height);
-        let max_extent = fragments
-            .iter()
-            .map(|fragment| (fragment.ascent() - axis).max(fragment.descent() + axis))
-            .max()
-            .unwrap_or_default();
-
-        let height = self
-            .size(ctx.styles())
-            .unwrap_or(Rel::one())
-            .resolve(ctx.styles())
-            .relative_to(2.0 * max_extent);
-
-        match fragments.as_mut_slice() {
-            [one] => scale(ctx, one, height, None),
-            [first, .., last] => {
-                scale(ctx, first, height, Some(MathClass::Opening));
-                scale(ctx, last, height, Some(MathClass::Closing));
-            }
-            _ => {}
-        }
-
-        ctx.extend(fragments);
-
-        Ok(())
-    }
-}
-
-/// Scale a math fragment to a height.
-fn scale(
-    ctx: &mut MathContext,
-    fragment: &mut MathFragment,
-    height: Abs,
-    apply: Option<MathClass>,
-) {
-    if matches!(
-        fragment.class(),
-        Some(MathClass::Opening | MathClass::Closing | MathClass::Fence)
-    ) {
-        let glyph = match fragment {
-            MathFragment::Glyph(glyph) => glyph.clone(),
-            MathFragment::Variant(variant) => {
-                GlyphFragment::new(ctx, variant.c, variant.span)
-            }
-            _ => return,
-        };
-
-        let short_fall = DELIM_SHORT_FALL.scaled(ctx);
-        let mut stretched = glyph.stretch_vertical(ctx, height, short_fall);
-        stretched.center_on_axis(ctx);
-
-        *fragment = MathFragment::Variant(stretched);
-        if let Some(class) = apply {
-            fragment.set_class(class);
-        }
-    }
+/// Scales delimiters vertically to the nearest surrounding `{lr()}` group.
+///
+/// ```example
+/// $ { x mid(|) sum_(i=1)^n w_i|f_i (x)| < 1 } $
+/// ```
+#[elem(Mathy)]
+pub struct MidElem {
+    /// The content to be scaled.
+    #[required]
+    pub body: Content,
 }
 
 /// Floors an expression.
@@ -105,7 +44,7 @@ fn scale(
 pub fn floor(
     /// The size of the brackets, relative to the height of the wrapped content.
     #[named]
-    size: Option<Smart<Rel<Length>>>,
+    size: Option<Rel<Length>>,
     /// The expression to floor.
     body: Content,
 ) -> Content {
@@ -121,7 +60,7 @@ pub fn floor(
 pub fn ceil(
     /// The size of the brackets, relative to the height of the wrapped content.
     #[named]
-    size: Option<Smart<Rel<Length>>>,
+    size: Option<Rel<Length>>,
     /// The expression to ceil.
     body: Content,
 ) -> Content {
@@ -137,7 +76,7 @@ pub fn ceil(
 pub fn round(
     /// The size of the brackets, relative to the height of the wrapped content.
     #[named]
-    size: Option<Smart<Rel<Length>>>,
+    size: Option<Rel<Length>>,
     /// The expression to round.
     body: Content,
 ) -> Content {
@@ -153,7 +92,7 @@ pub fn round(
 pub fn abs(
     /// The size of the brackets, relative to the height of the wrapped content.
     #[named]
-    size: Option<Smart<Rel<Length>>>,
+    size: Option<Rel<Length>>,
     /// The expression to take the absolute value of.
     body: Content,
 ) -> Content {
@@ -169,7 +108,7 @@ pub fn abs(
 pub fn norm(
     /// The size of the brackets, relative to the height of the wrapped content.
     #[named]
-    size: Option<Smart<Rel<Length>>>,
+    size: Option<Rel<Length>>,
     /// The expression to take the norm of.
     body: Content,
 ) -> Content {
@@ -180,16 +119,17 @@ fn delimited(
     body: Content,
     left: char,
     right: char,
-    size: Option<Smart<Rel<Length>>>,
+    size: Option<Rel<Length>>,
 ) -> Content {
+    let span = body.span();
     let mut elem = LrElem::new(Content::sequence([
-        TextElem::packed(left),
+        SymbolElem::packed(left),
         body,
-        TextElem::packed(right),
+        SymbolElem::packed(right),
     ]));
     // Push size only if size is provided
     if let Some(size) = size {
-        elem.push_size(size);
+        elem.size.set(size);
     }
-    elem.pack()
+    elem.pack().spanned(span)
 }
